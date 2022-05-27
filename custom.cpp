@@ -1,12 +1,10 @@
-#include <gst/gst.h>
-#include <gst/audio/audio.h>
-#include <string.h>
+#include "custom.hpp"
 
 #define CHUNK_SIZE 1024   /* Amount of bytes we are sending in each buffer */
 #define SAMPLE_RATE 44100 /* Samples per second we are sending */
 
 /* Structure to contain all our information, so we can pass it to callbacks */
-typedef struct _CustomData {
+struct CustomData {
   GstElement *pipeline, *app_source, *tee, *audio_queue, *audio_convert1, *audio_resample, *audio_sink;
   GstElement *video_queue, *audio_convert2, *visual, *video_convert, *video_sink;
   GstElement *app_queue, *app_sink;
@@ -17,13 +15,15 @@ typedef struct _CustomData {
   guint sourceid;        /* To control the GSource */
 
   GMainLoop *main_loop;  /* GLib's Main Loop */
-} CustomData;
+};
 
 /* This method is called by the idle GSource in the mainloop, to feed CHUNK_SIZE bytes into appsrc.
  * The idle handler is added to the mainloop when appsrc requests us to start sending data (need-data signal)
  * and is removed when appsrc has enough data (enough-data signal).
  */
-static gboolean push_data (CustomData *data) {
+#include <cmath>
+static int k = 0;
+gboolean push_data (ReceiverEntry *data) {
   GstBuffer *buffer;
   GstFlowReturn ret;
   int i;
@@ -42,19 +42,23 @@ static gboolean push_data (CustomData *data) {
   /* Generate some psychodelic waveforms */
   gst_buffer_map (buffer, &map, GST_MAP_WRITE);
   raw = (gint16 *)map.data;
-  data->c += data->d;
-  data->d -= data->c / 1000;
-  freq = 1100 + 1000 * data->d;
+  // data->c += data->d;
+  // data->d -= data->c / 1000;
+  // freq = 1100 + 1000 * data->d;
+  // for (i = 0; i < num_samples; i++) {
+  //   data->a += data->b;
+  //   data->b -= data->a / freq;
+  //   raw[i] = (gint16)(500 * data->a);
+  // }
+
   for (i = 0; i < num_samples; i++) {
-    data->a += data->b;
-    data->b -= data->a / freq;
-    raw[i] = (gint16)(500 * data->a);
+    raw[i] = (gint16)10000. * (sin(2 * 3.14 * 220 * k++ / SAMPLE_RATE ));
   }
   gst_buffer_unmap (buffer, &map);
   data->num_samples += num_samples;
 
   /* Push the buffer into the appsrc */
-  g_signal_emit_by_name (data->app_source, "push-buffer", buffer, &ret);
+  g_signal_emit_by_name (data->sound_in, "push-buffer", buffer, &ret);
 
   /* Free the buffer now that we are done with it */
   gst_buffer_unref (buffer);
@@ -69,7 +73,7 @@ static gboolean push_data (CustomData *data) {
 
 /* This signal callback triggers when appsrc needs data. Here, we add an idle handler
  * to the mainloop to start pushing data into the appsrc */
-static void start_feed (GstElement *source, guint size, CustomData *data) {
+void start_feed (GstElement *source, guint size, ReceiverEntry *data) {
   if (data->sourceid == 0) {
     g_print ("Start feeding\n");
     data->sourceid = g_idle_add ((GSourceFunc) push_data, data);
@@ -78,7 +82,7 @@ static void start_feed (GstElement *source, guint size, CustomData *data) {
 
 /* This callback triggers when appsrc has enough data and we can stop sending.
  * We remove the idle handler from the mainloop */
-static void stop_feed (GstElement *source, CustomData *data) {
+void stop_feed (GstElement *source, ReceiverEntry *data) {
   if (data->sourceid != 0) {
     g_print ("Stop feeding\n");
     g_source_remove (data->sourceid);
@@ -87,8 +91,8 @@ static void stop_feed (GstElement *source, CustomData *data) {
 }
 
 /* The appsink has received a buffer */
-static GstFlowReturn new_sample (GstElement *sink, CustomData *data) {
-  GstSample *sample;
+GstFlowReturn new_sample (GstElement *sink, ReceiverEntry *data) {
+  GstSample *sample{};
 
   /* Retrieve the buffer */
   g_signal_emit_by_name (sink, "pull-sample", &sample);
@@ -117,7 +121,7 @@ static void error_cb (GstBus *bus, GstMessage *msg, CustomData *data) {
   g_main_loop_quit (data->main_loop);
 }
 
-int main(int argc, char *argv[]) {
+int main2(int argc, char *argv[]) {
   CustomData data;
   GstPad *tee_audio_pad, *tee_video_pad, *tee_app_pad;
   GstPad *queue_audio_pad, *queue_video_pad, *queue_app_pad;
