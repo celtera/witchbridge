@@ -19,6 +19,13 @@ pkg_check_modules(GST REQUIRED
 )
 
 
-add_executable(gstreamer webrtc.cpp custom.cpp)
+add_executable(gstreamer webrtc.cpp custom.cpp custom.hpp witchbridge-av.hpp webrtc.html)
+target_include_directories(gstreamer PRIVATE /home/jcelerier/ossia/score/3rdparty/avendish/include)
 target_include_directories(gstreamer PRIVATE ${GTK3_INCLUDE_DIRS} ${GST_INCLUDE_DIRS} ${SOUP_INCLUDE_DIRS} ${JSON_GLIB_INCLUDE_DIRS})
-target_link_libraries(gstreamer ${GTK3_LIBRARIES} ${GST_LIBRARIES} ${SOUP_LIBRARIES} ${JSON_GLIB_LIBRARIES} boost_iostreams)
+#target_link_libraries(gstreamer ${GTK3_LIBRARIES} ${GST_LIBRARIES} ${SOUP_LIBRARIES} ${JSON_GLIB_LIBRARIES} boost_iostreams)
+
+target_link_libraries(gstreamer
+/home/jcelerier/projets/oss/gstreamer/build-gst-full/libgstreamer-full-1.0.so
+${SOUP_LIBRARIES}
+${JSON_GLIB_LIBRARIES}
+boost_iostreams)

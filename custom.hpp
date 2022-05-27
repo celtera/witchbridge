@@ -1,8 +1,10 @@
 #pragma once
-#include <gst/gst.h>
-#include <gst/audio/audio.h>
-#include <string.h>
-#include <libsoup/soup.h>
+#include <cstdint>
+
+struct _GstElement;
+typedef struct _GstElement GstElement;
+struct _SoupWebsocketConnection;
+typedef struct _SoupWebsocketConnection SoupWebsocketConnection;
 
 struct ReceiverEntry
 {
@@ -11,11 +13,10 @@ struct ReceiverEntry
   GstElement* pipeline = nullptr;
   GstElement* sound_in = nullptr;
   GstElement* webrtcbin = nullptr;
-  guint sourceid = 0;
-  guint64 num_samples;   /* Number of samples generated so far (for timestamp generation) */
+  uint32_t sourceid = 0;
+  uint64_t num_samples = 0;
 };
-struct CustomData;
-gboolean push_data (ReceiverEntry *data);
-void start_feed (GstElement *source, guint size, ReceiverEntry *data) ;
-void stop_feed (GstElement *source, ReceiverEntry *data) ;
-GstFlowReturn new_sample (GstElement *sink, ReceiverEntry *data) ;
+
+bool push_data(ReceiverEntry *data);
+void start_feed(GstElement *source, uint32_t size, ReceiverEntry *data) ;
+void stop_feed(GstElement *source, ReceiverEntry *data) ;

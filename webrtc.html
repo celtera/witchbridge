@@ -3,13 +3,14 @@
     <script type="text/javascript" src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
     <script type="text/javascript">
       var html5VideoElement;
+      var html5AudioElement;
       var websocketConnection;
       var webrtcPeerConnection;
       var webrtcConfiguration;
       var reportError;
 
-
-      function onLocalDescription(desc) {
+      function onLocalDescription(desc)
+      {
         console.log("Local description: " + JSON.stringify(desc));
         webrtcPeerConnection.setLocalDescription(desc).then(function() {
           websocketConnection.send(JSON.stringify({ type: "sdp", "data": webrtcPeerConnection.localDescription }));
@@ -17,26 +18,30 @@
       }
 
 
-      function onIncomingSDP(sdp) {
+      function onIncomingSDP(sdp)
+      {
         console.log("Incoming SDP: " + JSON.stringify(sdp));
         webrtcPeerConnection.setRemoteDescription(sdp).catch(reportError);
         webrtcPeerConnection.createAnswer().then(onLocalDescription).catch(reportError);
       }
 
 
-      function onIncomingICE(ice) {
+      function onIncomingICE(ice)
+      {
         var candidate = new RTCIceCandidate(ice);
         console.log("Incoming ICE: " + JSON.stringify(ice));
         webrtcPeerConnection.addIceCandidate(candidate).catch(reportError);
       }
 
 
-      function onAddRemoteStream(event) {
+      function onAddRemoteStream(event)
+      {
         html5VideoElement.srcObject = event.streams[0];
+        html5AudioElement.srcObject = event.streams[0];
       }
 
-
-      function onIceCandidate(event) {
+      function onIceCandidate(event)
+      {
         if (event.candidate == null)
           return;
 
@@ -44,8 +49,8 @@
         websocketConnection.send(JSON.stringify({ "type": "ice", "data": event.candidate }));
       }
 
-
-      function onServerMessage(event) {
+      function onServerMessage(event)
+      {
         var msg;
 
         try {
@@ -67,28 +72,24 @@
         }
       }
 
+      function playStream(configuration)
+      {
+        const l = window.location;
+        const wsUrl = "ws://" + l.hostname + ":" + l.port + "/ws";
 
-      function playStream(videoElement, hostname, port, path, configuration, reportErrorCB) {
-        var l = window.location;
-        var wsHost = (hostname != undefined) ? hostname : l.hostname;
-        var wsPort = (port != undefined) ? port : l.port;
-        var wsPath = (path != undefined) ? path : "ws";
-        if (wsPort) 
-          wsPort = ":" + wsPort; 
-        var wsUrl = "ws://" + wsHost + wsPort + "/" + wsPath;
-
-        html5VideoElement = videoElement;
+        html5VideoElement = document.getElementById("stream");
+        html5AudioElement = document.getElementById("astream");
         webrtcConfiguration = configuration;
-        reportError = (reportErrorCB != undefined) ? reportErrorCB : function(text) {};
+        reportError = (errmsg) => { console.error(errmsg); };
 
         websocketConnection = new WebSocket(wsUrl);
         websocketConnection.addEventListener("message", onServerMessage);
       }
 
       window.onload = function() {
-        var vidstream = document.getElementById("stream");
-        var config = { 'iceServers': [{ 'urls': 'stun:%STUN_SERVER%' }] }; 
-        playStream(vidstream, null, null, null, config, function (errmsg) { console.error(errmsg); });
+        playStream({
+          'iceServers': [{ 'urls': 'stun:%STUN_SERVER%' }]
+        });
       };
 
     </script>
@@ -97,6 +98,7 @@
   <body>
     <div>
       <video id="stream" autoplay playsinline>Your browser does not support video</video>
+      <audio controls id="astream" >Your browser does not support video</audio>
     </div>
   </body>
 </html>
