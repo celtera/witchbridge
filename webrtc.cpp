@@ -182,8 +182,7 @@ struct Streamer
           "videoconvert ! queue max-size-buffers=1 ! "
           "x264enc bitrate=600 speed-preset=ultrafast tune=zerolatency "
           "key-int-max=15 ! "
-          "video/x-h264,profile=constrained-baseline ! queue "
-          "max-size-time=100000000 ! h264parse ! "
+          "video/x-h264,profile=constrained-baseline ! queue max-size-time=100 ! h264parse ! "
           "rtph264pay config-interval=-1 name=payloader "
           "aggregate-mode=zero-latency ! "
           "application/x-rtp,media=video,encoding-name=H264,payload=96 ! "
@@ -191,8 +190,7 @@ struct Streamer
 
     std::string pipeline_audio
         = " appsrc name=mysound ! "
-          "audioconvert ! audioresample ! opusenc ! rtpopuspay "
-          "pt=97 ! webrtcbin. ";
+          "audioconvert ! audioresample ! opusenc audio-type=restricted-lowdelay frame-size=2.5 ! rtpopuspay pt=97 ! webrtcbin. ";
 
     receiver_entry->pipeline = gst_parse_launch(
                                  (pipeline_web + pipeline_video + pipeline_audio).c_str(), &error);
@@ -203,6 +201,7 @@ struct Streamer
       goto cleanup;
     }
 
+    // Setup the sound source
     receiver_entry->sound_in
         = gst_bin_get_by_name(GST_BIN(receiver_entry->pipeline), "mysound");
     g_assert(receiver_entry->sound_in);
@@ -236,6 +235,13 @@ struct Streamer
           = gst_bin_get_by_name(GST_BIN(receiver_entry->pipeline), "webrtcbin");
       g_assert(receiver_entry->webrtcbin != nullptr);
 
+      // Setup the webrtc internal latency
+      auto rtpbin = gst_bin_get_by_name(GST_BIN(receiver_entry->webrtcbin), "rtpbin");
+      g_assert_nonnull (rtpbin);
+      g_object_set(rtpbin, "latency", 10, nullptr);
+      g_object_unref(rtpbin);
+
+      // Setup transceivers
       GArray* transceivers{};
       g_signal_emit_by_name(
             receiver_entry->webrtcbin, "get-transceivers", &transceivers);
