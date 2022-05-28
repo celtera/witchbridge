@@ -1,6 +1,7 @@
-#include "custom.hpp"
 
+#include "custom.hpp"
 #include <boost/iostreams/device/mapped_file.hpp>
+#include <boost/pool/object_pool.hpp>
 
 #include <cmath>
 #include <glib.h>
@@ -32,8 +33,25 @@
 #endif
 
 #include <iostream>
+#include <thread>
 
-#define SAMPLE_RATE 44100
+#include <rigtorp/SPSCQueue.h>
+#include <boost/circular_buffer.hpp>
+
+
+static constexpr int max_buffer = 4;
+
+struct audio_buffer
+{
+  float* audio[2];
+  int channels;
+  int frames;
+};
+
+struct audio_frame
+{
+  float sample[2];
+};
 const gchar* video_priority = "low";
 const gchar* audio_priority = "high";
 
@@ -42,8 +60,11 @@ typedef struct _GstElement GstElement;
 struct _SoupWebsocketConnection;
 typedef struct _SoupWebsocketConnection SoupWebsocketConnection;
 
+#define CHUNK_SIZE 1024*4   /* Amount of bytes we are sending in each buffer */
+struct Streamer;
 struct ReceiverEntry
 {
+  Streamer* self = nullptr;
   SoupWebsocketConnection* connection = nullptr;
 
   GstElement* pipeline = nullptr;
@@ -51,34 +72,44 @@ struct ReceiverEntry
   GstElement* webrtcbin = nullptr;
   uint32_t sourceid = 0;
   uint64_t num_samples = 0;
+
+  int64_t feed{};
+
+  boost::circular_buffer<audio_frame> buf = boost::circular_buffer<audio_frame>(128 * CHUNK_SIZE);
+  audio_frame next_frame() noexcept;
+
+  bool push_data_audio(audio_buffer buf);
 };
 
 //// Audio
 
-#define CHUNK_SIZE 1024   /* Amount of bytes we are sending in each buffer */
-#define SAMPLE_RATE 44100 /* Samples per second we are sending */
+
 struct Streamer
 {
+  config conf;
+
   static bool push_data_audio(ReceiverEntry* data)
   {
     const gint num_samples = CHUNK_SIZE / 4;
     GstBuffer* buffer = gst_buffer_new_and_alloc(CHUNK_SIZE);
 
     GST_BUFFER_TIMESTAMP(buffer)
-        = gst_util_uint64_scale(data->num_samples, GST_SECOND, SAMPLE_RATE);
+        = gst_util_uint64_scale(data->num_samples, GST_SECOND, data->self->conf.rate);
     GST_BUFFER_DURATION(buffer)
-        = gst_util_uint64_scale(num_samples, GST_SECOND, SAMPLE_RATE);
+        = gst_util_uint64_scale(num_samples, GST_SECOND, data->self->conf.rate);
 
     GstMapInfo map{};
+
     gst_buffer_map(buffer, &map, GST_MAP_WRITE);
 
     auto raw = (float*)map.data;
-    constexpr float cst = 2.f * 3.14f * 220.f / SAMPLE_RATE;
 
     for (int i = 0; i < num_samples; i++)
     {
-      raw[i] = std::sin(cst * data->num_samples++);
+      auto frame = data->next_frame();
+      raw[i] = frame.sample[0];
     }
+    data->num_samples += num_samples;
 
     gst_buffer_unmap(buffer, &map);
 
@@ -89,23 +120,26 @@ struct Streamer
     return ret == GST_FLOW_OK;
   }
 
+
   static void start_feed_audio(GstElement* source, guint size, ReceiverEntry* data)
   {
+    data->feed++;
+    /*
     if (data->sourceid == 0)
     {
       g_print("Start feeding\n");
       data->sourceid = g_idle_add((GSourceFunc)push_data_audio, data);
-    }
+    }*/
   }
 
   static void stop_feed_audio(GstElement* source, ReceiverEntry* data)
-  {
+  {/*
     if (data->sourceid != 0)
     {
       g_print("Stop feeding\n");
       g_source_remove(data->sourceid);
       data->sourceid = 0;
-    }
+    }*/
   }
 
   static gboolean
@@ -120,6 +154,7 @@ struct Streamer
 
       gst_message_parse_error(message, &error, &debug);
       g_error("Error on bus: %s (debug: %s)", error->message, debug);
+      exit(1);
       g_error_free(error);
       g_free(debug);
       break;
@@ -144,6 +179,8 @@ struct Streamer
 
   static GstWebRTCPriorityType _priority_from_string(const gchar* s)
   {
+    return GST_WEBRTC_PRIORITY_TYPE_MEDIUM;
+
     GEnumClass* klass
         = (GEnumClass*)g_type_class_ref(GST_TYPE_WEBRTC_PRIORITY_TYPE);
     GEnumValue* en;
@@ -158,11 +195,11 @@ struct Streamer
 
     return GstWebRTCPriorityType{};
   }
-  static ReceiverEntry*
-  create_receiver_entry(SoupWebsocketConnection* connection)
+  static std::shared_ptr<ReceiverEntry>
+  create_receiver_entry(SoupWebsocketConnection* connection, Streamer& self)
   {
-
-    auto receiver_entry = (ReceiverEntry*)g_slice_alloc0(sizeof(ReceiverEntry));
+    auto receiver_entry = std::make_shared<ReceiverEntry>();
+    receiver_entry->self = &self;
     receiver_entry->connection = connection;
 
     g_object_ref(G_OBJECT(connection));
@@ -171,11 +208,11 @@ struct Streamer
           G_OBJECT(connection),
           "message",
           G_CALLBACK(soup_websocket_message_cb),
-          (gpointer)receiver_entry);
+          (gpointer)receiver_entry.get());
 
     GError* error = nullptr;
     std::string pipeline_web
-        = "webrtcbin name=webrtcbin stun-server=stun://" STUN_SERVER;
+        = "webrtcbin latency=10 name=webrtcbin stun-server=stun://" STUN_SERVER;
     std::string pipeline_video
         = " videotestsrc is-live=1 pattern=snow ! videorate ! videoscale ! "
           "video/x-raw,width=64,height=64,framerate=60/1 ! "
@@ -189,8 +226,10 @@ struct Streamer
           "webrtcbin. ";
 
     std::string pipeline_audio
-        = " appsrc name=mysound ! "
-          "audioconvert ! audioresample ! opusenc audio-type=restricted-lowdelay frame-size=2.5 ! rtpopuspay pt=97 ! webrtcbin. ";
+        = " appsrc is-live=1 name=mysound ! "
+          "audioconvert ! audioresample ! "
+          "opusenc audio-type=restricted-lowdelay bandwidth=fullband bitrate=128000 frame-size=2.5 ! "
+          "rtpopuspay pt=97 ! webrtcbin. ";
 
     receiver_entry->pipeline = gst_parse_launch(
                                  (pipeline_web + pipeline_video + pipeline_audio).c_str(), &error);
@@ -198,7 +237,7 @@ struct Streamer
     {
       g_error("Could not create WebRTC pipeline: %s\n", error->message);
       g_error_free(error);
-      goto cleanup;
+      return {};
     }
 
     // Setup the sound source
@@ -208,7 +247,7 @@ struct Streamer
     {
       GstAudioInfo info;
       gst_audio_info_set_format(
-            &info, GST_AUDIO_FORMAT_F32, SAMPLE_RATE, 1, nullptr);
+            &info, GST_AUDIO_FORMAT_F32, self.conf.rate, 1, nullptr);
       GstCaps* audio_caps;
       audio_caps = gst_audio_info_to_caps(&info);
       g_object_set(
@@ -222,12 +261,16 @@ struct Streamer
             receiver_entry->sound_in,
             "need-data",
             G_CALLBACK(start_feed_audio),
-            receiver_entry);
+            receiver_entry.get());
       g_signal_connect(
             receiver_entry->sound_in,
             "enough-data",
             G_CALLBACK(stop_feed_audio),
-            receiver_entry);
+            receiver_entry.get());
+
+      // for(int i = 0; i < 16; i++) {
+      //   push_data_audio(receiver_entry);
+      // }
     }
 
     {
@@ -236,10 +279,14 @@ struct Streamer
       g_assert(receiver_entry->webrtcbin != nullptr);
 
       // Setup the webrtc internal latency
-      auto rtpbin = gst_bin_get_by_name(GST_BIN(receiver_entry->webrtcbin), "rtpbin");
-      g_assert_nonnull (rtpbin);
-      g_object_set(rtpbin, "latency", 10, nullptr);
-      g_object_unref(rtpbin);
+      {
+        auto rtpbin = gst_bin_get_by_name(GST_BIN(receiver_entry->webrtcbin), "rtpbin");
+        g_assert_nonnull (rtpbin);
+        g_object_set(rtpbin, "latency", 10, nullptr);
+        // g_object_set(rtpbin, "sync", false, nullptr);
+        // g_object_set(rtpbin, "async", false, nullptr);
+        g_object_unref(rtpbin);
+      }
 
       // Setup transceivers
       GArray* transceivers{};
@@ -292,13 +339,13 @@ struct Streamer
             receiver_entry->webrtcbin,
             "on-negotiation-needed",
             G_CALLBACK(on_negotiation_needed_cb),
-            (gpointer)receiver_entry);
+            (gpointer)receiver_entry.get());
 
       g_signal_connect(
             receiver_entry->webrtcbin,
             "on-ice-candidate",
             G_CALLBACK(on_ice_candidate_cb),
-            (gpointer)receiver_entry);
+            (gpointer)receiver_entry.get());
 
       GstBus* bus;
       bus = gst_pipeline_get_bus(GST_PIPELINE(receiver_entry->pipeline));
@@ -311,10 +358,6 @@ struct Streamer
       g_error("Could not start pipeline");
 
     return receiver_entry;
-
-cleanup:
-    destroy_receiver_entry((gpointer)receiver_entry);
-    return nullptr;
   }
   static void destroy_receiver_entry(gpointer receiver_entry_ptr)
   {
@@ -333,8 +376,6 @@ cleanup:
 
     if (receiver_entry->connection != nullptr)
       g_object_unref(G_OBJECT(receiver_entry->connection));
-
-    g_slice_free1(sizeof(ReceiverEntry), receiver_entry);
   }
   static void on_offer_created_cb(GstPromise* promise, gpointer user_data)
   {
@@ -416,7 +457,7 @@ cleanup:
 
     json_string = get_string_from_json_object(ice_json);
 
-    std::cerr << "on_ice_candidate_cb: JSON OUTPUT: '" << json_string << "'\n";
+    // std::cerr << "on_ice_candidate_cb: JSON OUTPUT: '" << json_string << "'\n";
     json_object_unref(ice_json);
 
     soup_websocket_connection_send_text(
@@ -585,13 +626,24 @@ unknown_message:
     g_error("Unknown message \"%s\", ignoring", data_string);
     goto cleanup;
   }
+
   static void soup_websocket_closed_cb(
       SoupWebsocketConnection* connection,
       gpointer user_data)
   {
-    GHashTable* receiver_entry_table = (GHashTable*)user_data;
+    Streamer& self = *(Streamer*)user_data;
+
+    for(auto it = self.receivers.begin(); it != self.receivers.end(); ) {
+      if((*it)->connection == connection) {
+        it = self.receivers.erase(it);
+        break;
+      } else {
+        ++it;
+      }
+    }
+    GHashTable* receiver_entry_table = self.receiver_entry_table;
     g_hash_table_remove(receiver_entry_table, connection);
-    gst_print("Closed websocket connection %p\n", (gpointer)connection);
+
   }
   static void soup_http_handler(
       G_GNUC_UNUSED SoupServer* soup_server,
@@ -610,7 +662,7 @@ unknown_message:
     }
 
     static boost::iostreams::mapped_file mmap(
-          "/home/jcelerier/projets/perso/gstreamer-webrtc/webrtc.html",
+          "webrtc.html",
           boost::iostreams::mapped_file::readonly);
     soup_buffer
         = soup_buffer_new(SOUP_MEMORY_STATIC, mmap.const_data(), mmap.size());
@@ -622,6 +674,7 @@ unknown_message:
 
     soup_message_set_status(message, SOUP_STATUS_OK);
   }
+
   static void soup_websocket_handler(
       G_GNUC_UNUSED SoupServer* server,
       SoupWebsocketConnection* connection,
@@ -629,8 +682,8 @@ unknown_message:
       G_GNUC_UNUSED SoupClientContext* client_context,
       gpointer user_data)
   {
-    ReceiverEntry* receiver_entry;
-    GHashTable* receiver_entry_table = (GHashTable*)user_data;
+    Streamer& self = *(Streamer*)user_data;
+    GHashTable* receiver_entry_table = self.receiver_entry_table;
 
     gst_print("Processing new websocket connection %p", (gpointer)connection);
 
@@ -638,10 +691,11 @@ unknown_message:
           G_OBJECT(connection),
           "closed",
           G_CALLBACK(soup_websocket_closed_cb),
-          (gpointer)receiver_entry_table);
+          &self);
 
-    receiver_entry = create_receiver_entry(connection);
-    g_hash_table_replace(receiver_entry_table, connection, receiver_entry);
+    auto receiver_entry = create_receiver_entry(connection, self);
+    self.receivers.push_back(receiver_entry);
+    g_hash_table_replace(receiver_entry_table, connection, receiver_entry.get());
   }
 
   static gchar* get_string_from_json_object(JsonObject* object)
@@ -662,37 +716,23 @@ unknown_message:
     return text;
   }
 
-#ifdef G_OS_UNIX
-  static gboolean exit_sighandler(gpointer user_data)
-  {
-    gst_print("Caught signal, stopping mainloop\n");
-    GMainLoop* mainloop = (GMainLoop*)user_data;
-    g_main_loop_quit(mainloop);
-    return TRUE;
-  }
-#endif
 
-  Streamer()
+  GMainLoop* mainloop{};
+  SoupServer* soup_server{};
+  GHashTable* receiver_entry_table{};
+
+  std::jthread impl;
+
+  void run()
   {
-    GMainLoop* mainloop;
-    SoupServer* soup_server;
-    GHashTable* receiver_entry_table;
     GError* error = nullptr;
 
-    int argc = 0;
-    char* argv[] = {nullptr};
-    gst_init(&argc, (char***)&argv);
     setlocale(LC_ALL, "C");
     receiver_entry_table = g_hash_table_new_full(
                              g_direct_hash, g_direct_equal, nullptr, destroy_receiver_entry);
 
     mainloop = g_main_loop_new(nullptr, FALSE);
     g_assert(mainloop != nullptr);
-
-#ifdef G_OS_UNIX
-    g_unix_signal_add(SIGINT, exit_sighandler, mainloop);
-    g_unix_signal_add(SIGTERM, exit_sighandler, mainloop);
-#endif
 
     soup_server = soup_server_new(
                     SOUP_SERVER_SERVER_HEADER, "webrtc-soup-server", nullptr);
@@ -704,7 +744,7 @@ unknown_message:
           nullptr,
           nullptr,
           soup_websocket_handler,
-          (gpointer)receiver_entry_table,
+          (gpointer)this,
           nullptr);
     soup_server_listen_all(
           soup_server, SOUP_HTTP_PORT, (SoupServerListenOptions)0, nullptr);
@@ -712,17 +752,152 @@ unknown_message:
     gst_print(
           "WebRTC page link: http://127.0.0.1:%d/\n", (gint)SOUP_HTTP_PORT);
 
+    g_timeout_add(1, (GSourceFunc) +[] (void* data) {
+      ((Streamer*)(data))->buffer_read_timeout(); }, this);
+
     g_main_loop_run(mainloop);
 
     g_object_unref(G_OBJECT(soup_server));
     g_hash_table_destroy(receiver_entry_table);
     g_main_loop_unref(mainloop);
-
-    gst_deinit();
   }
+
+  bool buffer_read_timeout()
+  {
+    ready = true;
+    int kmax = 20;
+    while(audio_buffer* p = to_send.front())
+    {
+      for(auto& receiver : receivers) {
+        // Don't buffer on receivers that haven't even started polling
+
+        receiver->push_data_audio(*p);
+/*
+        {
+          for(int f = 0; f < p->frames; f++) {
+            audio_frame frame;
+            for(int c = 0; c < p->channels; c++) {
+              frame.sample[c] = p->audio[c][f];
+            }
+
+            receiver->buf.push_back(frame);
+          }
+        }*/
+      }
+
+      to_free.push(*p);
+      to_send.pop();
+
+      if(kmax-- < 0)
+        break;
+    }
+    return true;
+  }
+
+  Streamer(config c)
+    : conf(c)
+    , to_send(64)
+    , to_free(64)
+    // , storage(4096 * 16)
+  {
+    static bool init = (gst_init(nullptr, nullptr), true);
+
+    impl = std::jthread{[this, c] { run(); } };
+  }
+
+  ~Streamer()
+  {
+    g_main_loop_quit(mainloop);
+    impl.join();
+
+
+    // gst_deinit();
+  }
+
+  std::vector<std::shared_ptr<ReceiverEntry>> receivers;
+  // boost::pool<> storage;
+  rigtorp::SPSCQueue<audio_buffer> to_send;
+  rigtorp::SPSCQueue<audio_buffer> to_free;
+  std::atomic_bool ready = false;
 };
 
-int main(int argc, char** argv)
+std::shared_ptr<Streamer> make_streamer(config c)
 {
-  Streamer s;
+  static std::shared_ptr<Streamer> s = std::make_unique<Streamer>(c);
+  return s;
+}
+
+void push_audio(Streamer& s, audio_buffer_view a)
+{
+  if(!s.ready)
+    return;
+
+  if(s.to_send.size() >= s.to_send.capacity())
+    return;
+
+  {
+    while(auto p = s.to_free.front()) {
+      free(p->audio[0]);
+
+      s.to_free.pop();
+    }
+  }
+
+  // FIXME use a proper memory pool
+  auto buf = (float*)malloc(a.channels * a.frames * sizeof(float));
+
+  audio_buffer bb{.audio = {buf}, .channels = a.channels, .frames = a.frames};
+  if(a.channels == 2) {
+    bb.audio[1] = bb.audio[0] + a.frames;
+  }
+
+  for(int c = 0; c < a.channels; c++) {
+    std::copy_n(a.audio[c], a.frames, bb.audio[c]);
+  }
+
+  s.to_send.push(bb);
+}
+
+audio_frame ReceiverEntry::next_frame() noexcept
+{
+  if(buf.empty())
+    return {{0.f, 0.f}};
+
+  auto res = buf.front();
+  buf.pop_front();
+  return res;
+}
+
+bool ReceiverEntry::push_data_audio(audio_buffer buf)
+{
+  if(feed == 0)
+    return true;
+
+  const gint num_samples = buf.frames;
+  GstBuffer* buffer = gst_buffer_new_and_alloc(buf.frames * sizeof(float));
+
+  GST_BUFFER_TIMESTAMP(buffer)
+      = gst_util_uint64_scale(this->num_samples, GST_SECOND, self->conf.rate);
+  GST_BUFFER_DURATION(buffer)
+      = gst_util_uint64_scale(num_samples, GST_SECOND, self->conf.rate);
+
+  GstMapInfo map{};
+
+  gst_buffer_map(buffer, &map, GST_MAP_WRITE);
+
+  auto raw = (float*)map.data;
+
+  for (int i = 0; i < buf.frames; i++)
+  {
+    raw[i] = buf.audio[0][i];
+  }
+  this->num_samples += num_samples;
+
+  gst_buffer_unmap(buffer, &map);
+
+  GstFlowReturn ret{};
+  g_signal_emit_by_name(sound_in, "push-buffer", buffer, &ret);
+  gst_buffer_unref(buffer);
+
+  return ret == GST_FLOW_OK;
 }
