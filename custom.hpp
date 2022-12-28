@@ -18,8 +18,13 @@ struct audio_buffer_view {
   int channels;
   int frames;
 };
+struct video_buffer_view {
+  unsigned char* bytes;
+  int width, height;
+};
 
 std::shared_ptr<Streamer> make_streamer(config c);
 
 void push_audio(Streamer&, audio_buffer_view a);
+void push_video(Streamer&, video_buffer_view a);
 

@@ -5,7 +5,10 @@
 
 #include <cmath>
 #include <glib.h>
+#include <gst/app/gstappsrc.h>
 #include <gst/audio/audio.h>
+#include <gst/video/video.h>
+
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
 #include <locale.h>
@@ -52,6 +55,13 @@ struct audio_frame
 {
   float sample[2];
 };
+
+struct video_buffer
+{
+  unsigned char* bytes;
+  int width, height;
+};
+
 const gchar* video_priority = "low";
 const gchar* audio_priority = "high";
 
@@ -69,16 +79,20 @@ struct ReceiverEntry
 
   GstElement* pipeline = nullptr;
   GstElement* sound_in = nullptr;
+  GstElement* video_in = nullptr;
   GstElement* webrtcbin = nullptr;
   uint32_t sourceid = 0;
   uint64_t num_samples = 0;
+  uint64_t num_frames = 0;
 
-  int64_t feed{};
+  int64_t audio_feed{};
+  int64_t video_feed{};
 
   boost::circular_buffer<audio_frame> buf = boost::circular_buffer<audio_frame>(128 * CHUNK_SIZE);
   audio_frame next_frame() noexcept;
 
   bool push_data_audio(audio_buffer buf);
+  bool push_data_video(video_buffer buf);
 };
 
 //// Audio
@@ -123,7 +137,7 @@ struct Streamer
 
   static void start_feed_audio(GstElement* source, guint size, ReceiverEntry* data)
   {
-    data->feed++;
+    data->audio_feed++;
     /*
     if (data->sourceid == 0)
     {
@@ -133,6 +147,27 @@ struct Streamer
   }
 
   static void stop_feed_audio(GstElement* source, ReceiverEntry* data)
+  {/*
+    if (data->sourceid != 0)
+    {
+      g_print("Stop feeding\n");
+      g_source_remove(data->sourceid);
+      data->sourceid = 0;
+    }*/
+  }
+
+  static void start_feed_video(GstElement* source, guint size, ReceiverEntry* data)
+  {
+    data->video_feed++;
+    /*
+    if (data->sourceid == 0)
+    {
+      g_print("Start feeding\n");
+      data->sourceid = g_idle_add((GSourceFunc)push_data_audio, data);
+    }*/
+  }
+
+  static void stop_feed_video(GstElement* source, ReceiverEntry* data)
   {/*
     if (data->sourceid != 0)
     {
@@ -212,21 +247,24 @@ struct Streamer
 
     GError* error = nullptr;
     std::string pipeline_web
-        = "webrtcbin latency=10 name=webrtcbin stun-server=stun://" STUN_SERVER;
+        = "webrtcbin latency=1 name=webrtcbin stun-server=stun://" STUN_SERVER;
     std::string pipeline_video
-        = " videotestsrc is-live=1 pattern=snow ! videorate ! videoscale ! "
-          "video/x-raw,width=64,height=64,framerate=60/1 ! "
-          "videoconvert ! queue max-size-buffers=1 ! "
-          "x264enc bitrate=600 speed-preset=ultrafast tune=zerolatency "
-          "key-int-max=15 ! "
-          "video/x-h264,profile=constrained-baseline ! queue max-size-time=100 ! h264parse ! "
-          "rtph264pay config-interval=-1 name=payloader "
-          "aggregate-mode=zero-latency ! "
-          "application/x-rtp,media=video,encoding-name=H264,payload=96 ! "
-          "webrtcbin. ";
+        = "   appsrc is-live=1 name=myvid leaky-type=2 min-latency=0  "
+          " ! videorate "
+          " ! videoscale "
+          " ! video/x-raw,width=1280,height=720,framerate=60/1 "
+          " ! videoconvert "
+          " ! queue max-size-buffers=1 "
+          " ! x264enc bitrate=2400 speed-preset=medium tune=zerolatency key-int-max=15 "
+          " ! video/x-h264,profile=constrained-baseline "
+          " ! queue max-size-time=100 "
+          " ! h264parse "
+          " ! rtph264pay config-interval=-1 name=payloader aggregate-mode=zero-latency "
+          " ! application/x-rtp,media=video,encoding-name=H264,payload=96 "
+          " ! webrtcbin. ";
 
     std::string pipeline_audio
-        = " appsrc is-live=1 name=mysound ! "
+        = " appsrc is-live=1 name=mysound leaky-type=2 min-latency=0 ! "
           "audioconvert ! audioresample ! "
           "opusenc audio-type=restricted-lowdelay bandwidth=fullband bitrate=128000 frame-size=2.5 ! "
           "rtpopuspay pt=97 ! webrtcbin. ";
@@ -241,10 +279,11 @@ struct Streamer
     }
 
     // Setup the sound source
-    receiver_entry->sound_in
-        = gst_bin_get_by_name(GST_BIN(receiver_entry->pipeline), "mysound");
-    g_assert(receiver_entry->sound_in);
     {
+      receiver_entry->sound_in
+          = gst_bin_get_by_name(GST_BIN(receiver_entry->pipeline), "mysound");
+      g_assert(receiver_entry->sound_in);
+
       GstAudioInfo info;
       gst_audio_info_set_format(
             &info, GST_AUDIO_FORMAT_F32, self.conf.rate, 1, nullptr);
@@ -271,6 +310,36 @@ struct Streamer
       // for(int i = 0; i < 16; i++) {
       //   push_data_audio(receiver_entry);
       // }
+    }
+
+    // Setup the video source
+    {
+      receiver_entry->video_in
+          = gst_bin_get_by_name(GST_BIN(receiver_entry->pipeline), "myvid");
+      GstVideoInfo info;
+      gst_video_info_set_format(&info, GST_VIDEO_FORMAT_RGBA, 1280, 720);
+      GstCaps* video_caps = gst_video_info_to_caps(&info);
+
+      g_object_set(
+          receiver_entry->video_in,
+          "caps",
+          video_caps,
+          "format",
+          GST_FORMAT_TIME,
+          nullptr);
+
+      g_signal_connect(
+          receiver_entry->video_in,
+          "need-data",
+          G_CALLBACK(start_feed_video),
+          receiver_entry.get());
+
+      g_signal_connect(
+          receiver_entry->video_in,
+          "enough-data",
+          G_CALLBACK(stop_feed_video),
+          receiver_entry.get());
+
     }
 
     {
@@ -464,6 +533,7 @@ struct Streamer
           receiver_entry->connection, json_string);
     g_free(json_string);
   }
+
   static void soup_websocket_message_cb(
       G_GNUC_UNUSED SoupWebsocketConnection* connection,
       SoupWebsocketDataType data_type,
@@ -766,7 +836,7 @@ unknown_message:
   {
     ready = true;
     int kmax = 20;
-    while(audio_buffer* p = to_send.front())
+    while(audio_buffer* p = audio_to_send.front())
     {
       for(auto& receiver : receivers) {
         // Don't buffer on receivers that haven't even started polling
@@ -785,8 +855,22 @@ unknown_message:
         }*/
       }
 
-      to_free.push(*p);
-      to_send.pop();
+      audio_to_free.push(*p);
+      audio_to_send.pop();
+
+      if(kmax-- < 0)
+        break;
+    }
+
+    kmax = 20;
+    while(video_buffer* p = video_to_send.front())
+    {
+      for(auto& receiver : receivers) {
+        receiver->push_data_video(*p);
+      }
+
+      video_to_free.push(*p);
+      video_to_send.pop();
 
       if(kmax-- < 0)
         break;
@@ -796,8 +880,10 @@ unknown_message:
 
   Streamer(config c)
     : conf(c)
-    , to_send(64)
-    , to_free(64)
+    , audio_to_send(64)
+    , audio_to_free(64)
+    , video_to_send(16)
+    , video_to_free(16)
     // , storage(4096 * 16)
   {
     static bool init = (gst_init(nullptr, nullptr), true);
@@ -816,8 +902,11 @@ unknown_message:
 
   std::vector<std::shared_ptr<ReceiverEntry>> receivers;
   // boost::pool<> storage;
-  rigtorp::SPSCQueue<audio_buffer> to_send;
-  rigtorp::SPSCQueue<audio_buffer> to_free;
+  rigtorp::SPSCQueue<audio_buffer> audio_to_send;
+  rigtorp::SPSCQueue<audio_buffer> audio_to_free;
+
+  rigtorp::SPSCQueue<video_buffer> video_to_free;
+  rigtorp::SPSCQueue<video_buffer> video_to_send;
   std::atomic_bool ready = false;
 };
 
@@ -832,14 +921,14 @@ void push_audio(Streamer& s, audio_buffer_view a)
   if(!s.ready)
     return;
 
-  if(s.to_send.size() >= s.to_send.capacity())
+  if(s.audio_to_send.size() >= s.audio_to_send.capacity())
     return;
 
   {
-    while(auto p = s.to_free.front()) {
+    while(auto p = s.audio_to_free.front()) {
       free(p->audio[0]);
 
-      s.to_free.pop();
+      s.audio_to_free.pop();
     }
   }
 
@@ -855,7 +944,33 @@ void push_audio(Streamer& s, audio_buffer_view a)
     std::copy_n(a.audio[c], a.frames, bb.audio[c]);
   }
 
-  s.to_send.push(bb);
+  s.audio_to_send.push(bb);
+}
+
+void push_video(Streamer& s, video_buffer_view a)
+{
+  if(!s.ready)
+    return;
+
+  if(s.video_to_send.size() >= s.video_to_send.capacity())
+    return;
+
+  {
+    while(auto p = s.video_to_free.front()) {
+      free(p->bytes);
+
+      s.video_to_free.pop();
+    }
+  }
+
+  // FIXME use a proper memory pool
+  auto buf = (unsigned char*)malloc(a.width * a.height * 4);
+
+  video_buffer bb{.bytes = buf, .width = a.width, .height = a.height};
+
+  memcpy(buf, a.bytes, a.width * a.height * 4);
+
+  s.video_to_send.push(bb);
 }
 
 audio_frame ReceiverEntry::next_frame() noexcept
@@ -870,7 +985,7 @@ audio_frame ReceiverEntry::next_frame() noexcept
 
 bool ReceiverEntry::push_data_audio(audio_buffer buf)
 {
-  if(feed == 0)
+  if(audio_feed == 0)
     return true;
 
   const gint num_samples = buf.frames;
@@ -895,9 +1010,29 @@ bool ReceiverEntry::push_data_audio(audio_buffer buf)
 
   gst_buffer_unmap(buffer, &map);
 
-  GstFlowReturn ret{};
-  g_signal_emit_by_name(sound_in, "push-buffer", buffer, &ret);
-  gst_buffer_unref(buffer);
+  return gst_app_src_push_buffer(GST_APP_SRC(this->sound_in), buffer);
+}
 
-  return ret == GST_FLOW_OK;
+bool ReceiverEntry::push_data_video(video_buffer buf)
+{
+  if(video_feed == 0)
+    return true;
+
+  GstBuffer* buffer = gst_buffer_new_and_alloc(buf.width * buf.height * 4);
+
+
+  GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer) = this->num_frames * 16666666;
+  // GST_BUFFER_TIMESTAMP(buffer) = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(this->num_frames * 16666)).count();
+  // GST_BUFFER_DURATION(buffer) = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::microseconds(16666)).count();
+  GstMapInfo map{};
+
+  gst_buffer_map(buffer, &map, GST_MAP_WRITE);
+
+  auto raw = (unsigned char*)map.data;
+  memcpy(raw, buf.bytes, buf.width * buf.height * 4);
+  this->num_frames++;
+
+  gst_buffer_unmap(buffer, &map);
+
+  return gst_app_src_push_buffer(GST_APP_SRC(this->video_in), buffer);
 }
